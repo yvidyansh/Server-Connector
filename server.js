@@ -8,6 +8,7 @@ const { BedrockRuntimeClient, InvokeModelCommand } = require('@aws-sdk/client-be
 const { google } = require('googleapis');
 const { ConfidentialClientApplication } = require('@azure/msal-node');
 const { Client } = require('@microsoft/microsoft-graph-client');
+const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
 require('dotenv').config();
 
 const app = express();
@@ -168,6 +169,123 @@ app.post('/api/bedrock', async (req, res) => {
     res.status(500).json({ success: false, error: error.message });
   }
 });
+
+app.post('/api/s3/create-files', async (req, res) => {
+  try {
+    const { prompt, bucketName, fileCount = 10, awsCredentials } = req.body;
+    if (!bucketName || !awsCredentials) {
+      return res.status(400).json({
+        success: false,
+        error: 'Bucket name and AWS credentials are required'
+      });
+    }
+    // Create S3 client with user-provided credentials
+    const userS3Client = new S3Client({
+      region: awsCredentials.region || 'us-east-2',
+      credentials: {
+        accessKeyId: awsCredentials.accessKeyId,
+        secretAccessKey: awsCredentials.secretAccessKey,
+        ...(awsCredentials.sessionToken && { sessionToken: awsCredentials.sessionToken })
+      }
+    });
+    const file_type_names = ["TXT", "MARKDOWN", "HTML", "CSV", "RTF"];
+    const teamFolders = ['hr', 'legal', 'policies', 'documentation', 'finance'];
+    const createdFiles = [];
+    const failedFiles = [];
+    // Generate project name from prompt using AI
+    const namePrompt = `Extract a company name or project name from this prompt: "${prompt}"
+Return ONLY a short, clean name (2-4 words max) suitable for a folder name. If no specific company/project name is found, create a relevant project name based on the context.
+Examples:
+    - "Create marketing materials for TechCorp" → "TechCorp"
+    - "Develop HR policies for startup" → "HR-Policies-Project"
+Return only the name:`;
+    let projectName;
+    try {
+      const nameInput = {
+        modelId: 'anthropic.claude-3-5-sonnet-20240620-v1:0',
+        contentType: 'application/json',
+        accept: 'application/json',
+        body: JSON.stringify({
+          anthropic_version: 'bedrock-2023-05-31',
+          max_tokens: 100,
+          messages: [{ role: 'user', content: namePrompt }]
+        })
+      };
+      const nameCommand = new InvokeModelCommand(nameInput);
+      const nameResponse = await client.send(nameCommand);
+      const nameBody = JSON.parse(new TextDecoder().decode(nameResponse.body));
+      projectName = nameBody.content[0].text.trim().replace(/[^a-zA-Z0-9\s-]/g, '').replace(/\s+/g, '-').toLowerCase().substring(0, 25);
+    } catch (error) {
+      projectName = prompt.replace(/[^a-zA-Z0-9\s]/g, '').replace(/\s+/g, '-').toLowerCase().substring(0, 20);
+    }
+    for (let i = 0; i < fileCount; i++) {
+      try {
+        const randomTeam = teamFolders[Math.floor(Math.random() * teamFolders.length)];
+        const randomFileType = file_type_names[Math.floor(Math.random() * file_type_names.length)];
+        const filePrompt = `Generate professional ${randomFileType} content for ${randomTeam} team based on this issue: "${prompt}".
+Requirements:
+- Write exactly 100-200 words
+- Make it relevant and specific to the issue
+- Use professional business language
+- Include actionable information related to resolving the issue
+- Format appropriately for ${randomFileType}
+Return only the content, no explanations:`;
+        const input = {
+          modelId: 'anthropic.claude-3-5-sonnet-20240620-v1:0',
+          contentType: 'application/json',
+          accept: 'application/json',
+          body: JSON.stringify({
+            anthropic_version: 'bedrock-2023-05-31',
+            max_tokens: 500,
+            messages: [{ role: 'user', content: filePrompt }]
+          })
+        };
+        const command = new InvokeModelCommand(input);
+        const aiResponse = await client.send(command);
+        const responseBody = JSON.parse(new TextDecoder().decode(aiResponse.body));
+        const content = responseBody.content[0].text.trim();
+        const extensions = { TXT: '.txt', MARKDOWN: '.md', HTML: '.html', CSV: '.csv', RTF: '.rtf' };
+        const fileName = `${randomTeam}_${i + 1}${extensions[randomFileType]}`;
+        // S3 key with nested structure: s3-q-connector/project-name/team/filename
+        const s3Key = `s3-q-connector/${projectName}/${randomTeam}/${fileName}`;
+        const uploadCommand = new PutObjectCommand({
+          Bucket: bucketName,
+          Key: s3Key,
+          Body: content,
+          ContentType: 'text/plain'
+        });
+        await userS3Client.send(uploadCommand);
+        createdFiles.push({
+          name: fileName,
+          team: randomTeam,
+          fileType: randomFileType,
+          size: content.length,
+          s3Key: s3Key,
+          url: `https://${bucketName}.s3.${awsCredentials.region || 'us-east-1'}.amazonaws.com/${s3Key}`
+        });
+      } catch (fileError) {
+        console.error(`Failed to create file ${i + 1}:`, fileError.message);
+        failedFiles.push({
+          index: i + 1,
+          error: fileError.message
+        });
+      }
+    }
+    res.json({
+      success: createdFiles.length > 0,
+      filesCreated: createdFiles.length,
+      files: createdFiles,
+      failedFiles: failedFiles,
+      projectFolder: `s3-q-connector/${projectName}`,
+      bucketName: bucketName,
+      message: `Created ${createdFiles.length} files in S3 nested structure`
+    });
+  } catch (error) {
+    console.error('S3 error:', error.message);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // jira
 app.post('/api/create-issues', async (req, res) => {
   try {
