@@ -15,7 +15,7 @@ const PORT = process.env.PORT || 5000;
 
 // CORS configuration for both React apps
 app.use(cors({
-  origin: ['http://localhost:3000', 'http://localhost:4321', 'http://0.0.0.0:4321'],
+  origin:'*',
   credentials: true
 }));
 app.use(express.json());
@@ -59,19 +59,22 @@ function generateRelevantFile(fileType, fileName, content) {
     fs.mkdirSync(path.join(__dirname, 'temp'));
   }
   
+  // Convert content to string if it's an array
+  const stringContent = Array.isArray(content) ? content.join('\n') : String(content);
+  
   let fileContent;
   switch (fileType) {
     case 'TXT':
     case 'MARKDOWN':
     case 'HTML':
     case 'RST':
-      fileContent = content;
+      fileContent = stringContent;
       break;
     case 'CSV':
-      fileContent = `Title,Description,Content\n"${fileName}","Generated file","${content.replace(/"/g, '""')}"`;
+      fileContent = `Title,Description,Content\n"${fileName}","Generated file","${stringContent.replace(/"/g, '""')}"`;
       break;
     case 'TSV':
-      fileContent = `Title\tDescription\tContent\n${fileName}\tGenerated file\t${content}`;
+      fileContent = `Title\tDescription\tContent\n${fileName}\tGenerated file\t${stringContent}`;
       break;
     case 'SVG':
       fileContent = `<svg width="200" height="100" xmlns="http://www.w3.org/2000/svg"><rect width="200" height="100" fill="#4f46e5"/><text x="10" y="30" fill="white" font-size="12">${fileName}</text></svg>`;
@@ -84,7 +87,7 @@ function generateRelevantFile(fileType, fileName, content) {
       fs.writeFileSync(filePath, Buffer.from(imageData, 'base64'));
       return filePath;
     default:
-      fileContent = content;
+      fileContent = stringContent;
   }
   
   fs.writeFileSync(filePath, fileContent);
@@ -134,11 +137,10 @@ function generateRandomFile(fileType, issueTitle) {
 }
 
 const client = new BedrockRuntimeClient({
-  region: process.env.AWS_REGION || 'us-east-1',
+  region: process.env.AWS_REGION || 'us-west-2',
   credentials: {
     accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
-    sessionToken: process.env.AWS_SESSION_TOKEN
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
   }
 });
 
@@ -146,7 +148,7 @@ app.post('/api/bedrock', async (req, res) => {
   try {
     const { prompt } = req.body;
     const input = {
-      modelId: 'anthropic.claude-sonnet-4-20250514-v1:0',
+      modelId: 'anthropic.claude-3-5-sonnet-20241022-v2:0',
       contentType: 'application/json',
       accept: 'application/json',
       body: JSON.stringify({
@@ -227,7 +229,7 @@ Return ONLY this JSON array format:
 Create issues title unique .
 No explanations, no markdown, just the JSON array:`;
     const input = {
-      modelId: 'anthropic.claude-sonnet-4-20250514-v1:0',
+      modelId: 'anthropic.claude-3-5-sonnet-20241022-v2:0',
       contentType: 'application/json',
       accept: 'application/json',
       body: JSON.stringify({
@@ -290,6 +292,10 @@ No explanations, no markdown, just the JSON array:`;
         );
         
         const issueKey = jiraResponse.data.key;
+        console.log(`Created issue: ${issueKey} - ${issue.title}`);
+        
+        // Wait for issue to be fully created before adding comments/worklogs
+        await new Promise(resolve => setTimeout(resolve, 2000));
         
         // Add random attachments to issue (1-2 attachments)
         const attachmentCount = Math.floor(Math.random() * 2) + 1;
@@ -331,7 +337,7 @@ No explanations, no markdown, just the JSON array:`;
           
           try {
             const commentInput = {
-              modelId: 'anthropic.claude-sonnet-4-20250514-v1:0',
+              modelId: 'anthropic.claude-3-5-sonnet-20241022-v2:0',
               contentType: 'application/json',
               accept: 'application/json',
               body: JSON.stringify({
@@ -363,6 +369,8 @@ No explanations, no markdown, just the JSON array:`;
               { headers: { Authorization: `Basic ${auth}`, 'Content-Type': 'application/json' } }
             );
             
+            console.log(`Added comment to ${issueKey}:`, commentText.substring(0, 50) + '...');
+            
             // Add attachment to comment if needed
             if (hasAttachment) {
               const randomFileType = file_type_names[Math.floor(Math.random() * file_type_names.length)];
@@ -391,8 +399,11 @@ No explanations, no markdown, just the JSON array:`;
               }
             }
           } catch (commentError) {
-            console.error('Failed to add comment:', commentError.response?.data);
+            console.error('Failed to add comment:', commentError.response?.data || commentError.message);
           }
+          
+          // Small delay between comments
+          await new Promise(resolve => setTimeout(resolve, 500));
         }
         
         // Add random worklogs (1-3 worklogs per issue)
@@ -403,7 +414,7 @@ No explanations, no markdown, just the JSON array:`;
           
           try {
             const worklogInput = {
-              modelId: 'anthropic.claude-sonnet-4-20250514-v1:0',
+              modelId: 'anthropic.claude-3-5-sonnet-20241022-v2:0',
               contentType: 'application/json',
               accept: 'application/json',
               body: JSON.stringify({
@@ -439,9 +450,14 @@ No explanations, no markdown, just the JSON array:`;
               },
               { headers: { Authorization: `Basic ${auth}`, 'Content-Type': 'application/json' } }
             );
+            
+            console.log(`Added ${timeSpent}h worklog to ${issueKey}:`, worklogDescription.substring(0, 50) + '...');
           } catch (worklogError) {
-            console.error('Failed to add worklog:', worklogError.response?.data);
+            console.error('Failed to add worklog:', worklogError.response?.data || worklogError.message);
           }
+          
+          // Small delay between worklogs
+          await new Promise(resolve => setTimeout(resolve, 500));
         }
         
         createdIssues.push(jiraResponse.data);
@@ -633,7 +649,11 @@ Return only the content, no explanations:`;
     });
   } catch (error) {
     console.error('OneDrive error:', error.response?.data || error.message);
-    res.status(500).json({ success: false, error: error.response?.data?.error?.message || error.message });
+    if (error.message.includes('Invalid character in header')) {
+      res.status(400).json({ success: false, error: 'Invalid access token format' });
+    } else {
+      res.status(500).json({ success: false, error: error.response?.data?.error?.message || error.message });
+    }
   }
 });
 
@@ -647,40 +667,34 @@ app.post('/api/upload-gdrive-files', async (req, res) => {
     const drive = google.drive({ version: 'v3', auth });
     
     const createdItems = [];
-    const folderCache = {};
+    const folderStructure = {};
     
-    // Generate relevant folder structure with AI
-    const folderPrompt = `Generate 4-5 relevant folder names for project: "${prompt}"
-
-Return ONLY a JSON array of folder names:
-["Folder1", "Folder2", "Folder3", "Folder4"]
-
-Make folders specific to the project context.`;
+    // Generate project name from prompt
+    const namePrompt = `Extract a clean project name from: "${prompt}"
+Return ONLY the name (2-4 words max), no quotes:`;
     
-    const folderInput = {
-      modelId: 'anthropic.claude-3-5-sonnet-20241022-v2:0',
-      contentType: 'application/json',
-      accept: 'application/json',
-      body: JSON.stringify({
-        anthropic_version: 'bedrock-2023-05-31',
-        max_tokens: 300,
-        messages: [{ role: 'user', content: folderPrompt }]
-      })
-    };
-    
-    const folderCommand = new InvokeModelCommand(folderInput);
-    const folderResponse = await client.send(folderCommand);
-    const folderBody = JSON.parse(new TextDecoder().decode(folderResponse.body));
-    
-    let folderNames;
+    let projectName;
     try {
-      const jsonMatch = folderBody.content[0].text.match(/\[.*\]/s);
-      folderNames = jsonMatch ? JSON.parse(jsonMatch[0]) : ['Documents', 'Resources', 'Data', 'Reports'];
+      const nameInput = {
+        modelId: 'anthropic.claude-3-5-sonnet-20241022-v2:0',
+        contentType: 'application/json',
+        accept: 'application/json',
+        body: JSON.stringify({
+          anthropic_version: 'bedrock-2023-05-31',
+          max_tokens: 50,
+          messages: [{ role: 'user', content: namePrompt }]
+        })
+      };
+      
+      const nameCommand = new InvokeModelCommand(nameInput);
+      const nameResponse = await client.send(nameCommand);
+      const nameBody = JSON.parse(new TextDecoder().decode(nameResponse.body));
+      projectName = nameBody.content[0].text.trim().replace(/[^a-zA-Z0-9\s-]/g, '').replace(/\s+/g, '-');
     } catch {
-      folderNames = ['Documents', 'Resources', 'Data', 'Reports'];
+      projectName = prompt.replace(/[^a-zA-Z0-9\s]/g, '').replace(/\s+/g, '-').substring(0, 20);
     }
     
-    // Create folders with relevant names
+    // Create folder helper
     const createFolder = async (folderName, parentId = null) => {
       const folder = await drive.files.create({
         requestBody: {
@@ -689,35 +703,49 @@ Make folders specific to the project context.`;
           parents: parentId ? [parentId] : undefined
         }
       });
-      
-      folderCache[folder.data.id] = folderName;
       return folder.data.id;
     };
     
-    // Create main folders and some subfolders
-    const rootFolders = [];
-    for (const folderName of folderNames) {
-      const folderId = await createFolder(folderName);
-      rootFolders.push(folderId);
-      
-      // 50% chance to create subfolder
-      if (Math.random() > 0.5) {
-        await createFolder(`${folderName}_Archive`, folderId);
-      }
-    }
+    // Create main project structure
+    const mainFolderId = await createFolder('gdrive-q-connector');
+    const projectFolderId = await createFolder(projectName, mainFolderId);
     
-    // Generate relevant files with AI
+    // Create organized subfolders
+    const subfolders = {
+      'Documents': await createFolder('Documents', projectFolderId),
+      'Resources': await createFolder('Resources', projectFolderId),
+      'Data': await createFolder('Data', projectFolderId),
+      'Reports': await createFolder('Reports', projectFolderId)
+    };
+    
+    // Create additional subfolders in each main folder
+    const docSubfolder = await createFolder('Templates', subfolders['Documents']);
+    const resourceSubfolder = await createFolder('Images', subfolders['Resources']);
+    const dataSubfolder = await createFolder('Raw', subfolders['Data']);
+    const reportSubfolder = await createFolder('Monthly', subfolders['Reports']);
+    
+    // Extended folder structure for file placement
+    folderStructure['Documents'] = subfolders['Documents'];
+    folderStructure['Documents-Templates'] = docSubfolder;
+    folderStructure['Resources'] = subfolders['Resources'];
+    folderStructure['Resources-Images'] = resourceSubfolder;
+    folderStructure['Data'] = subfolders['Data'];
+    folderStructure['Data-Raw'] = dataSubfolder;
+    folderStructure['Reports'] = subfolders['Reports'];
+    folderStructure['Reports-Monthly'] = reportSubfolder;
+    
+    // Generate and upload files
+    const folderKeys = Object.keys(folderStructure);
+    
     for (let i = 0; i < fileCount; i++) {
       try {
         const randomFileType = file_type_names[Math.floor(Math.random() * file_type_names.length)];
+        const folderKey = folderKeys[Math.floor(Math.random() * folderKeys.length)];
+        const folderId = folderStructure[folderKey];
         
-        // Generate relevant file name and content
-        const filePrompt = `Generate a relevant ${randomFileType} file name and content for project: "${prompt}"
-
-Return ONLY JSON:
-{"name": "filename_without_extension", "content": "relevant_file_content"}
-
-Make it specific to the project.`;
+        // Generate relevant file content
+        const filePrompt = `Generate ${randomFileType} content for ${folderKey.replace('-', ' ')} folder related to: "${prompt}"
+Write 100-150 words of relevant professional content. Return only the content:`;
         
         const fileInput = {
           modelId: 'anthropic.claude-3-5-sonnet-20241022-v2:0',
@@ -733,29 +761,15 @@ Make it specific to the project.`;
         const fileCommand = new InvokeModelCommand(fileInput);
         const fileResponse = await client.send(fileCommand);
         const fileBody = JSON.parse(new TextDecoder().decode(fileResponse.body));
+        const fileContent = fileBody.content[0].text.trim();
         
-        let fileName, fileContent;
-        try {
-          const jsonMatch = fileBody.content[0].text.match(/\{.*\}/s);
-          const fileData = jsonMatch ? JSON.parse(jsonMatch[0]) : null;
-          fileName = fileData?.name || `project_file_${i + 1}`;
-          fileContent = fileData?.content || `Content for ${prompt} - File ${i + 1}`;
-        } catch {
-          fileName = `project_file_${i + 1}`;
-          fileContent = `Content for ${prompt} - File ${i + 1}`;
-        }
-        
-        // Create file with relevant content
+        const fileName = `${folderKey.toLowerCase()}_${i + 1}`;
         const filePath = generateRelevantFile(randomFileType, fileName, fileContent);
-        
-        // Random folder selection
-        const allFolders = Object.keys(folderCache);
-        const randomFolder = allFolders[Math.floor(Math.random() * allFolders.length)];
         
         const uploadedFile = await drive.files.create({
           requestBody: {
             name: `${fileName}.${randomFileType.toLowerCase()}`,
-            parents: [randomFolder]
+            parents: [folderId]
           },
           media: {
             mimeType: 'application/octet-stream',
@@ -766,8 +780,9 @@ Make it specific to the project.`;
         createdItems.push({
           id: uploadedFile.data.id,
           name: uploadedFile.data.name,
-          folder: folderCache[randomFolder],
-          type: randomFileType
+          folder: folderKey,
+          type: randomFileType,
+          path: `gdrive-q-connector/${projectName}/${folderKey.replace('-', '/')}`
         });
         
         fs.unlinkSync(filePath);
@@ -778,9 +793,14 @@ Make it specific to the project.`;
     
     res.json({
       success: true,
-      message: `Uploaded ${createdItems.length} files to ${Object.keys(folderCache).length} folders for: ${prompt}`,
+      message: `Created organized folder structure with ${createdItems.length} files`,
+      projectPath: `gdrive-q-connector/${projectName}`,
       files: createdItems,
-      folders: Object.values(folderCache)
+      folderStructure: {
+        main: 'gdrive-q-connector',
+        project: projectName,
+        subfolders: Object.keys(folderStructure)
+      }
     });
     
   } catch (error) {
@@ -821,10 +841,5 @@ if (require.main === module) {
     console.log(`Server running on port ${PORT}`);
     console.log(`Original client: http://localhost:${PORT}/client`);
     console.log(`APIs available at: http://localhost:${PORT}/api/*`);
-    console.log(`\n--- TODO: FRIEND'S KATAL INTEGRATION ---`);
-    console.log(`1. Get Katal build from friend's laptop`);
-    console.log(`2. Update katalBuildPath in server.js`);
-    console.log(`3. Uncomment Katal routes and static serving`);
-    console.log(`4. Update CORS origins if needed`);
   });
 }
