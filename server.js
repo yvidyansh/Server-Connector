@@ -9,6 +9,7 @@ const { google } = require('googleapis');
 const { ConfidentialClientApplication } = require('@azure/msal-node');
 const { Client } = require('@microsoft/microsoft-graph-client');
 const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
+
 require('dotenv').config();
 
 const app = express();
@@ -16,9 +17,20 @@ const PORT = process.env.PORT || 5000;
 
 // CORS configuration for both React apps
 app.use(cors({
-  origin:'*',
-  credentials: true
+  origin: '*',
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
 }));
+
+// Handle preflight requests
+app.options('*', (req, res) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
+  res.sendStatus(200);
+});
+
 app.use(express.json());
 
 // TODO: FRIEND'S KATAL APP - Replace with actual Katal build path when available
@@ -26,10 +38,10 @@ app.use(express.json());
 // app.use('/katal', express.static(katalBuildPath));
 
 // Serve original React build files
-const clientBuildPath = path.join(__dirname, '../client/build');
-if (fs.existsSync(clientBuildPath)) {
-  app.use('/client', express.static(clientBuildPath));
-}
+// const clientBuildPath = path.join(__dirname, '../client/build');
+// if (fs.existsSync(clientBuildPath)) {
+//   app.use('/client', express.static(clientBuildPath));
+// }
 
 // Health check endpoint
 app.get('/api/health', (req, res) => {
@@ -137,13 +149,7 @@ function generateRandomFile(fileType, issueTitle) {
   return filePath;
 }
 
-const client = new BedrockRuntimeClient({
-  region: process.env.AWS_REGION || 'us-west-2',
-  credentials: {
-    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
-  }
-});
+
 
 app.post('/api/bedrock', async (req, res) => {
   try {
@@ -289,7 +295,7 @@ Return only the content, no explanations:`;
 // jira
 app.post('/api/create-issues', async (req, res) => {
   try {
-    const { prompt, jiraConfig, issueCount = 3, projectName, projectKey } = req.body;
+    const { prompt, jiraConfig, issueCount = 3, projectName, projectKey, securityLevel = 'Mixed' } = req.body;
     const auth = Buffer.from(`${jiraConfig.email}:${jiraConfig.apiToken}`).toString('base64');
     
     let finalProjectKey = projectKey || jiraConfig.projectKey;
@@ -384,6 +390,16 @@ No explanations, no markdown, just the JSON array:`;
     
     for (const issue of issues) {
       try {
+        // Add security level as label
+        let securityLabels = [];
+        if (securityLevel === 'Mixed') {
+          securityLabels = Math.random() > 0.5 ? ['confidential'] : ['open'];
+        } else if (securityLevel === 'Confidential') {
+          securityLabels = ['confidential'];
+        } else if (securityLevel === 'Open') {
+          securityLabels = ['open'];
+        }
+        
         const jiraIssue = {
           fields: {
             project: { key: finalProjectKey },
@@ -399,7 +415,8 @@ No explanations, no markdown, just the JSON array:`;
                 }]
               }]
             },
-            issuetype: { id: defaultIssueType.id }
+            issuetype: { id: defaultIssueType.id },
+            labels: securityLabels
           }
         };
         
@@ -767,7 +784,14 @@ Return only the content, no explanations:`;
     });
   } catch (error) {
     console.error('OneDrive error:', error.response?.data || error.message);
-    if (error.message.includes('Invalid character in header')) {
+    
+    if (error.response?.data?.error?.code === 'InvalidAuthenticationToken') {
+      res.status(401).json({ 
+        success: false, 
+        error: 'Access token expired or invalid. Please re-authenticate with OneDrive.',
+        code: 'TOKEN_EXPIRED'
+      });
+    } else if (error.message.includes('Invalid character in header')) {
       res.status(400).json({ success: false, error: 'Invalid access token format' });
     } else {
       res.status(500).json({ success: false, error: error.response?.data?.error?.message || error.message });
@@ -955,9 +979,445 @@ module.exports = app;
 
 // Start server only if not in Lambda environment
 if (require.main === module) {
-  app.listen(PORT, () => {
+  app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server running on port ${PORT}`);
-    console.log(`Original client: http://localhost:${PORT}/client`);
-    console.log(`APIs available at: http://localhost:${PORT}/api/*`);
+    console.log(`Server accessible at: http://0.0.0.0:${PORT}`);
+    console.log(`APIs available at: http://0.0.0.0:${PORT}/api/*`);
   });
 }
+
+// SharePoint file creation with site content updates
+app.post('/api/sharepoint/create-files', async (req, res) => {
+  try {
+    const { 
+      prompt, 
+      accessToken, 
+      siteUrl, 
+      libraryName = 'Documents',
+      fileCount = 10, 
+      createFolders = false,
+      updateSiteContent = false 
+    } = req.body;
+    
+    if (!accessToken || !siteUrl) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Access token and site URL are required' 
+      });
+    }
+    
+    const file_type_names = ["TXT", "MARKDOWN", "HTML", "CSV", "RTF"];
+    const teamFolders = ['Documents', 'Resources', 'Reports'];
+    const createdFiles = [];
+    const failedFiles = [];
+    const folderCache = {};
+    
+    // Get site ID first
+    const urlObj = new URL(siteUrl);
+    const hostname = urlObj.hostname;
+    const sitePath = urlObj.pathname;
+    
+    // Get site information
+    const siteInfoResponse = await axios.get(
+      `https://graph.microsoft.com/v1.0/sites/${hostname}:${sitePath}`,
+      { headers: { 'Authorization': `Bearer ${accessToken}` } }
+    );
+    
+    const siteId = siteInfoResponse.data.id;
+    const baseUrl = `https://graph.microsoft.com/v1.0/sites/${siteId}`;
+    
+    // Generate project name
+    const namePrompt = `Extract a project name from: "${prompt}"\nReturn ONLY the name (2-4 words max):`;
+    let projectName;
+    try {
+      const nameInput = {
+        modelId: 'anthropic.claude-3-5-sonnet-20241022-v2:0',
+        contentType: 'application/json',
+        accept: 'application/json',
+        body: JSON.stringify({
+          anthropic_version: 'bedrock-2023-05-31',
+          max_tokens: 50,
+          messages: [{ role: 'user', content: namePrompt }]
+        })
+      };
+      const nameCommand = new InvokeModelCommand(nameInput);
+      const nameResponse = await client.send(nameCommand);
+      const nameBody = JSON.parse(new TextDecoder().decode(nameResponse.body));
+      projectName = nameBody.content[0].text.trim().replace(/[^a-zA-Z0-9\s-]/g, '').replace(/\s+/g, '-');
+    } catch {
+      projectName = prompt.replace(/[^a-zA-Z0-9\s]/g, '').replace(/\s+/g, '-').substring(0, 20);
+    }
+    
+    // Create folder helper
+    const createFolder = async (folderName, parentPath = '') => {
+      try {
+        const folderPath = parentPath ? `${parentPath}/${folderName}` : folderName;
+        const response = await axios.post(
+          `${baseUrl}/drive/root${parentPath ? `:/${parentPath}:` : ''}/children`,
+          {
+            name: folderName,
+            folder: {},
+            '@microsoft.graph.conflictBehavior': 'rename'
+          },
+          {
+            headers: {
+              'Authorization': `Bearer ${accessToken}`,
+              'Content-Type': 'application/json'
+            }
+          }
+        );
+        return { id: response.data.id, path: folderPath };
+      } catch (error) {
+        if (error.response?.status === 409) {
+          // Folder exists, get its ID
+          const searchResponse = await axios.get(
+            `${baseUrl}/drive/root${parentPath ? `:/${parentPath}:` : ''}/children?$filter=name eq '${folderName}'`,
+            { headers: { 'Authorization': `Bearer ${accessToken}` } }
+          );
+          const folder = searchResponse.data.value[0];
+          return { id: folder?.id, path: `${parentPath}/${folderName}` };
+        }
+        throw error;
+      }
+    };
+    
+    // Create main project folder in specified library
+    const mainFolder = await createFolder(`${libraryName}-q-connector-${projectName}`);
+    
+    // Create nested folder structure if enabled
+    if (createFolders) {
+      for (const team of teamFolders) {
+        const teamFolder = await createFolder(team, mainFolder.path);
+        folderCache[team] = teamFolder;
+        
+        // Create sub-folders (3 levels deep)
+        const subFolders = ['Active', 'Archive', 'Templates'];
+        for (const sub of subFolders) {
+          const subFolder = await createFolder(sub, teamFolder.path);
+          folderCache[`${team}-${sub}`] = subFolder;
+        }
+      }
+    } else {
+      for (const team of teamFolders) {
+        const teamFolder = await createFolder(team, mainFolder.path);
+        folderCache[team] = teamFolder;
+      }
+    }
+    
+    // Generate and upload files
+    for (let i = 0; i < fileCount; i++) {
+      try {
+        const randomTeam = teamFolders[Math.floor(Math.random() * teamFolders.length)];
+        const randomFileType = file_type_names[Math.floor(Math.random() * file_type_names.length)];
+        
+        // Choose folder (nested or flat)
+        let targetFolder;
+        if (createFolders) {
+          const subFolders = ['Active', 'Archive', 'Templates'];
+          const randomSub = subFolders[Math.floor(Math.random() * subFolders.length)];
+          targetFolder = folderCache[`${randomTeam}-${randomSub}`];
+        } else {
+          targetFolder = folderCache[randomTeam];
+        }
+        
+        const filePrompt = `Generate professional ${randomFileType} content for ${randomTeam} team related to: "${prompt}". Write 100-150 words. Return only the content:`;
+        
+        const input = {
+          modelId: 'anthropic.claude-3-5-sonnet-20241022-v2:0',
+          contentType: 'application/json',
+          accept: 'application/json',
+          body: JSON.stringify({
+            anthropic_version: 'bedrock-2023-05-31',
+            max_tokens: 400,
+            messages: [{ role: 'user', content: filePrompt }]
+          })
+        };
+        
+        const command = new InvokeModelCommand(input);
+        const aiResponse = await client.send(command);
+        const responseBody = JSON.parse(new TextDecoder().decode(aiResponse.body));
+        const content = responseBody.content[0].text.trim();
+        
+        const extensions = { TXT: '.txt', MARKDOWN: '.md', HTML: '.html', CSV: '.csv', RTF: '.rtf' };
+        const fileName = `${randomTeam}_${i + 1}${extensions[randomFileType]}`;
+        
+        // Upload file
+        const uploadResponse = await axios.put(
+          `${baseUrl}/drive/items/${targetFolder.id}:/${fileName}:/content`,
+          content,
+          {
+            headers: {
+              'Authorization': `Bearer ${accessToken}`,
+              'Content-Type': 'text/plain'
+            }
+          }
+        );
+        
+        createdFiles.push({
+          name: fileName,
+          team: randomTeam,
+          fileType: randomFileType,
+          size: content.length,
+          path: `${targetFolder.path}/${fileName}`,
+          webUrl: uploadResponse.data.webUrl
+        });
+        
+      } catch (fileError) {
+        failedFiles.push({
+          index: i + 1,
+          error: fileError.response?.data?.error?.message || fileError.message
+        });
+      }
+    }
+    
+    // Update site homepage and navigation if enabled
+    let siteUpdates = {};
+    if (updateSiteContent) {
+      try {
+        // Generate homepage content
+        const homepagePrompt = `Create a professional SharePoint homepage overview for project: "${prompt}". Include project description, key objectives, and team structure. Write 200-300 words in HTML format:`;
+        
+        const homepageInput = {
+          modelId: 'anthropic.claude-3-5-sonnet-20241022-v2:0',
+          contentType: 'application/json',
+          accept: 'application/json',
+          body: JSON.stringify({
+            anthropic_version: 'bedrock-2023-05-31',
+            max_tokens: 600,
+            messages: [{ role: 'user', content: homepagePrompt }]
+          })
+        };
+        
+        const homepageCommand = new InvokeModelCommand(homepageInput);
+        const homepageResponse = await client.send(homepageCommand);
+        const homepageBody = JSON.parse(new TextDecoder().decode(homepageResponse.body));
+        const homepageContent = homepageBody.content[0].text.trim();
+        
+        // Update site homepage
+        const pagesResponse = await axios.get(
+          `${baseUrl}/pages`,
+          { headers: { 'Authorization': `Bearer ${accessToken}` } }
+        );
+        
+        const homePage = pagesResponse.data.value.find(page => page.name === 'Home.aspx');
+        if (homePage) {
+          await axios.patch(
+            `${baseUrl}/pages/${homePage.id}`,
+            {
+              title: `${projectName} - Project Overview`,
+              description: `Generated content for ${projectName}`
+            },
+            {
+              headers: {
+                'Authorization': `Bearer ${accessToken}`,
+                'Content-Type': 'application/json'
+              }
+            }
+          );
+        }
+        
+        siteUpdates.homepage = {
+          updated: true,
+          title: `${projectName} - Project Overview`,
+          content: homepageContent.substring(0, 200) + '...'
+        };
+        
+        // Create navigation links
+        const navLinks = teamFolders.map(folder => ({
+          name: folder,
+          url: `${siteUrl}/Shared Documents/${mainFolder.path}/${folder}`
+        }));
+        
+        siteUpdates.navigation = {
+          updated: true,
+          links: navLinks
+        };
+        
+      } catch (updateError) {
+        siteUpdates.error = updateError.message;
+      }
+    }
+    
+    res.json({
+      success: createdFiles.length > 0,
+      filesCreated: createdFiles.length,
+      files: createdFiles,
+      failedFiles: failedFiles,
+      projectFolder: mainFolder.path,
+      nestedStructure: createFolders,
+      siteUpdates: siteUpdates,
+      message: `Created ${createdFiles.length} files in SharePoint${createFolders ? ' with nested folders' : ''}${updateSiteContent ? ' and updated site content' : ''}`
+    });
+    
+  } catch (error) {
+    console.error('SharePoint error:', error.response?.data || error.message);
+    
+    if (error.response?.data?.error?.code === 'InvalidAuthenticationToken') {
+      res.status(401).json({ 
+        success: false, 
+        error: 'Access token expired or invalid. Please re-authenticate with SharePoint.',
+        code: 'TOKEN_EXPIRED'
+      });
+    } else {
+      res.status(500).json({ success: false, error: error.response?.data?.error?.message || error.message });
+    }
+  }
+});
+// Gmail email generation with attachments
+app.post('/api/gmail/generate-emails', async (req, res) => {
+  try {
+    const { 
+      prompt, 
+      accessToken, 
+      emailCount = 5,
+      recipientEmail = 'test@example.com'
+    } = req.body;
+    
+    if (!accessToken || !prompt) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Access token and prompt are required' 
+      });
+    }
+    
+    const createdEmails = [];
+    const failedEmails = [];
+    
+    for (let i = 0; i < emailCount; i++) {
+      try {
+        // Generate unique subject
+        const subjectPrompt = `Generate a unique professional email subject line for email ${i + 1} related to: "${prompt}". Make it specific and actionable. Return only the subject line:`;
+        
+        const subjectInput = {
+          modelId: 'anthropic.claude-3-5-sonnet-20241022-v2:0',
+          contentType: 'application/json',
+          accept: 'application/json',
+          body: JSON.stringify({
+            anthropic_version: 'bedrock-2023-05-31',
+            max_tokens: 100,
+            messages: [{ role: 'user', content: subjectPrompt }]
+          })
+        };
+        
+        const subjectCommand = new InvokeModelCommand(subjectInput);
+        const subjectResponse = await client.send(subjectCommand);
+        const subjectBody = JSON.parse(new TextDecoder().decode(subjectResponse.body));
+        const subject = subjectBody.content[0].text.trim().replace(/"/g, '');
+        
+        // Generate email body
+        const bodyPrompt = `Write a professional email body for: "${subject}" related to project: "${prompt}". Write 150-200 words. Include specific details and actionable items. Return only the email content:`;
+        
+        const bodyInput = {
+          modelId: 'anthropic.claude-3-5-sonnet-20241022-v2:0',
+          contentType: 'application/json',
+          accept: 'application/json',
+          body: JSON.stringify({
+            anthropic_version: 'bedrock-2023-05-31',
+            max_tokens: 500,
+            messages: [{ role: 'user', content: bodyPrompt }]
+          })
+        };
+        
+        const bodyCommand = new InvokeModelCommand(bodyInput);
+        const bodyResponse = await client.send(bodyCommand);
+        const bodyResponseBody = JSON.parse(new TextDecoder().decode(bodyResponse.body));
+        const emailBody = bodyResponseBody.content[0].text.trim();
+        
+        // Create attachment
+        const attachmentType = ['TXT', 'CSV', 'HTML'][Math.floor(Math.random() * 3)];
+        const attachmentPrompt = `Generate ${attachmentType} content for attachment related to: "${subject}". Write 100-150 words of relevant professional content. Return only the content:`;
+        
+        const attachmentInput = {
+          modelId: 'anthropic.claude-3-5-sonnet-20241022-v2:0',
+          contentType: 'application/json',
+          accept: 'application/json',
+          body: JSON.stringify({
+            anthropic_version: 'bedrock-2023-05-31',
+            max_tokens: 400,
+            messages: [{ role: 'user', content: attachmentPrompt }]
+          })
+        };
+        
+        const attachmentCommand = new InvokeModelCommand(attachmentInput);
+        const attachmentResponse = await client.send(attachmentCommand);
+        const attachmentResponseBody = JSON.parse(new TextDecoder().decode(attachmentResponse.body));
+        const attachmentContent = attachmentResponseBody.content[0].text.trim();
+        
+        // Create attachment file
+        const extensions = { TXT: '.txt', CSV: '.csv', HTML: '.html' };
+        const attachmentName = `attachment_${i + 1}${extensions[attachmentType]}`;
+        const attachmentBase64 = Buffer.from(attachmentContent).toString('base64');
+        
+        // Compose email
+        const email = {
+          raw: Buffer.from(
+            `To: ${recipientEmail}\r\n` +
+            `Subject: ${subject}\r\n` +
+            `Content-Type: multipart/mixed; boundary="boundary123"\r\n\r\n` +
+            `--boundary123\r\n` +
+            `Content-Type: text/plain; charset="UTF-8"\r\n\r\n` +
+            `${emailBody}\r\n\r\n` +
+            `--boundary123\r\n` +
+            `Content-Type: text/plain; name="${attachmentName}"\r\n` +
+            `Content-Disposition: attachment; filename="${attachmentName}"\r\n` +
+            `Content-Transfer-Encoding: base64\r\n\r\n` +
+            `${attachmentBase64}\r\n` +
+            `--boundary123--`
+          ).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+        };
+        
+        // Send email via Gmail API
+        const emailResponse = await axios.post(
+          'https://gmail.googleapis.com/gmail/v1/users/me/messages/send',
+          email,
+          {
+            headers: {
+              'Authorization': `Bearer ${accessToken}`,
+              'Content-Type': 'application/json'
+            }
+          }
+        );
+        
+        createdEmails.push({
+          id: emailResponse.data.id,
+          subject: subject,
+          recipient: recipientEmail,
+          attachmentName: attachmentName,
+          attachmentType: attachmentType,
+          bodyLength: emailBody.length
+        });
+        
+        // Small delay between emails
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        
+      } catch (emailError) {
+        console.error(`Failed to create email ${i + 1}:`, emailError.response?.data || emailError.message);
+        failedEmails.push({
+          index: i + 1,
+          error: emailError.response?.data?.error?.message || emailError.message
+        });
+      }
+    }
+    
+    res.json({
+      success: createdEmails.length > 0,
+      emailsCreated: createdEmails.length,
+      emails: createdEmails,
+      failedEmails: failedEmails,
+      message: `Generated ${createdEmails.length} emails with unique subjects and attachments`
+    });
+    
+  } catch (error) {
+    console.error('Gmail error:', error.response?.data || error.message);
+    
+    if (error.response?.data?.error?.code === 'invalid_grant') {
+      res.status(401).json({ 
+        success: false, 
+        error: 'Access token expired or invalid. Please re-authenticate with Gmail.',
+        code: 'TOKEN_EXPIRED'
+      });
+    } else {
+      res.status(500).json({ success: false, error: error.response?.data?.error?.message || error.message });
+    }
+  }
+});
